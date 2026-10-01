@@ -33,11 +33,11 @@
 <script>
 // ---------- settings (tweak freely) ----------
 const CFG = {
-  slideSeconds: 8,          // time per image
+  slideSeconds: 30,         // time per image
   rescanSeconds: 300,        // re-read the images folder this often
   motionThreshold: 28,      // per-pixel brightness change that counts as "movement" (0-255)
   presenceFraction: 0.012,  // fraction of pixels changed to count as someone being there
-  holdSeconds: 2.5,         // keep spiders coming this long after last movement
+  holdSeconds: 15,          // keep spiders coming this long after last movement
   maxSpiders: 40,
   repo: 'zevenrodriguez/Halloween',                 // 'owner/repo' - only needed on a custom domain
   branch: '',               // optional, defaults to the repo's default branch
@@ -129,7 +129,7 @@ const cv = $('spiders'), ctx = cv.getContext('2d');
 let W, H, S, dpr;
 function resize() {
   dpr = window.devicePixelRatio || 1;
-  W = innerWidth; H = innerHeight; S = H / 1080;   // scale everything relative to a 1080p-high screen
+  W = innerWidth; H = innerHeight; S = Math.min(W, H) / 1080;   // scale relative to a 1080px-wide screen (works portrait or landscape)
   cv.width = W * dpr; cv.height = H * dpr;
 }
 addEventListener('resize', resize); resize();
@@ -157,7 +157,7 @@ class Spider {
       const rest = { a: side*(0.55 + k*0.5), r: 2.4 + (k===1||k===2 ? 0.5 : 0) };
       this.feet.push({ rest, x:0, y:0, tx:0, ty:0, t:1, init:false, phase: (k+ (side>0?0:1)) % 2 });
     }
-    this.dead = false;
+    this.dead = false; this.alpha = 1;
   }
   restPos(f) {
     const a = this.angle + f.rest.a + (f.rest.a>0 ? 0 : 0);
@@ -190,6 +190,7 @@ class Spider {
   }
   draw(c) {
     const s = this.size;
+    c.globalAlpha = this.alpha;
     c.lineCap = 'round'; c.lineJoin = 'round';
     c.strokeStyle = '#050505';
     for (const f of this.feet) {
@@ -285,7 +286,11 @@ function frame(now) {
 
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,W,H);
-  for (const s of spiders) { s.update(dt); s.draw(ctx); }
+  for (const s of spiders) {
+    if (!present) { s.alpha -= dt; if (s.alpha <= 0) s.dead = true; }   // clear leftovers once the hold time is up
+    s.update(dt); s.draw(ctx);
+  }
+  ctx.globalAlpha = 1;
   for (let i=spiders.length-1;i>=0;i--) if (spiders[i].dead) spiders.splice(i,1);
 
   if (document.body.classList.contains('debug'))
