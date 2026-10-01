@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halloween Display</title>
+<style>
+  :root { --bg:#000; --fg:#f4a340; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); cursor:none; }
+  .slide { position:fixed; inset:0; width:100vw; height:100vh; object-fit:cover;
+           opacity:0; transition:opacity 1.5s ease-in-out; }
+  .slide.show { opacity:1; }
+  #spiders { position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:10; }
+  #cam { position:fixed; right:16px; bottom:16px; width:320px; border:2px solid var(--fg);
+         z-index:20; display:none; transform:scaleX(-1); opacity:.85; }
+  #hud { position:fixed; left:16px; top:16px; z-index:20; color:var(--fg); font:16px/1.4 ui-monospace,monospace;
+         background:rgba(0,0,0,.6); padding:8px 12px; display:none; white-space:pre; }
+  #msg { position:fixed; inset:0; z-index:30; display:none; place-items:center; text-align:center;
+         color:var(--fg); font:32px/1.5 system-ui,sans-serif; background:rgba(0,0,0,.85); cursor:default; }
+  #msg button { font:inherit; padding:.4em 1.2em; margin-top:1em; background:var(--fg); color:#000; border:0; cursor:pointer; }
+  body.debug #cam, body.debug #hud { display:block; }
+  body.debug { cursor:default; }
+</style>
+</head>
+<body>
+<img class="slide" id="a" alt=""><img class="slide" id="b" alt="">
+<canvas id="spiders"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="hud"></div>
+<div id="msg"><div id="msgtxt"></div></div>
+
+<script>
+// ---------- settings (tweak freely) ----------
+const CFG = {
+  slideSeconds: 8,          // time per image
+  rescanSeconds: 300,        // re-read the images folder this often
+  motionThreshold: 28,      // per-pixel brightness change that counts as "movement" (0-255)
+  presenceFraction: 0.012,  // fraction of pixels changed to count as someone being there
+  holdSeconds: 2.5,         // keep spiders coming this long after last movement
+  maxSpiders: 40,
+  repo: '',                 // 'owner/repo' - only needed on a custom domain
+  branch: '',               // optional, defaults to the repo's default branch
+  idleSpiders: 0,           // spiders crawling with nobody around
+};
+
+const $ = id => document.getElementById(id);
+const msg = (html) => { $('msgtxt').innerHTML = html; $('msg').style.display = html ? 'grid' : 'none'; };
+
+// ---------- slideshow ----------
+let images = [], idx = 0, front = $('a'), back = $('b'), timer = null;
+
+function shuffle(a) { for (let i=a.length-1;i>0;i--){const j=Math.random()*(i+1)|0;[a[i],a[j]]=[a[j],a[i]];} return a; }
+
+function setImages(list) {
+  const prev = images[idx];
+  const same = list.length === images.length && list.every(x => images.includes(x));
+  if (same) return;
+  images = shuffle(list.slice());
+  idx = Math.max(0, images.indexOf(prev));
+  if (!timer && images.length) { msg(''); showNext(true); }
+}
+
+function showNext(first) {
+  if (!images.length) return;
+  if (!first) idx = (idx + 1) % images.length;
+  const src = images[idx];
+  const pre = new Image();
+  pre.onload = pre.onerror = () => {
+    back.src = src;
+    back.classList.add('show'); front.classList.remove('show');
+    [front, back] = [back, front];
+  };
+  pre.src = src;
+  clearTimeout(timer);
+  timer = setTimeout(() => showNext(), CFG.slideSeconds * 1000);
+}
+
+// On GitHub Pages (user.github.io/repo) the images folder is listed through GitHub's API.
+// Using a custom domain? Set CFG.repo = 'owner/repo' (and optionally CFG.branch).
+const EXT = /\.(jpe?g|png|webp|gif|avif|bmp)$/i;
+function repoInfo() {
+  if (CFG.repo) return CFG.repo;
+  const m = location.hostname.match(/^([^.]+)\.github\.io$/);
+  const repo = location.pathname.split('/')[1] || (m && m[1] + '.github.io');
+  return m && repo ? `${m[1]}/${repo}` : null;
+}
+
+async function listImages() {
+  const repo = repoInfo();
+  if (repo) {
+    const ref = CFG.branch ? `?ref=${CFG.branch}` : '';
+    const r = await fetch(`https://api.github.com/repos/${repo}/contents/images${ref}`);
+    if (!r.ok) throw new Error('GitHub API ' + r.status);
+    return (await r.json()).filter(f => f.type === 'file' && EXT.test(f.name))
+                           .map(f => 'images/' + encodeURIComponent(f.name));
+  }
+  throw new Error('not on GitHub Pages');
+}
+
+async function scan() {
+  try {
+    const list = await listImages();
+    if (!list.length) msg('Add images to the <b>images</b> folder in the repo.');
+    setImages(list);
+  } catch (e) {
+    console.warn(e);
+    if (!images.length) offerPicker();   // local file / API failure: manual folder picker
+  }
+}
+
+function offerPicker() {
+  msg('Couldn\'t read the images folder automatically.<br>Pick it manually:<br><button id="pick">Choose images folder</button>');
+  $('pick').onclick = async () => {
+    try {
+      const dir = await showDirectoryPicker();
+      const urls = [];
+      for await (const [name, h] of dir.entries())
+        if (h.kind === 'file' && /\.(jpe?g|png|webp|gif|avif|bmp)$/i.test(name))
+          urls.push(URL.createObjectURL(await h.getFile()));
+      if (urls.length) setImages(urls);
+    } catch {}
+  };
+}
+scan(); setInterval(scan, CFG.rescanSeconds * 1000);
+
+// ---------- spiders ----------
+const cv = $('spiders'), ctx = cv.getContext('2d');
+let W, H, S, dpr;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight; S = H / 1080;   // scale everything relative to a 1080p-high screen
+  cv.width = W * dpr; cv.height = H * dpr;
+}
+addEventListener('resize', resize); resize();
+
+const rand = (a,b) => a + Math.random()*(b-a);
+const spiders = [];
+
+class Spider {
+  constructor(target) {
+    this.size = rand(28, 70) * S;
+    // enter from a random edge, head across the screen (biased toward where the motion is)
+    const edge = Math.random()*4|0, m = this.size*3;
+    if (edge===0) { this.x=-m; this.y=rand(0,H); }
+    else if (edge===1) { this.x=W+m; this.y=rand(0,H); }
+    else if (edge===2) { this.y=-m; this.x=rand(0,W); }
+    else { this.y=H+m; this.x=rand(0,W); }
+    const tx = target && Math.random()<0.6 ? target.x : rand(W*.2, W*.8);
+    const ty = target && Math.random()<0.6 ? target.y : rand(H*.2, H*.8);
+    this.angle = Math.atan2(ty - this.y, tx - this.x);
+    this.speed = rand(160, 380) * S;
+    this.wob = rand(0, 6.28); this.wobSpeed = rand(1.5, 4);
+    this.feet = [];
+    for (let i=0;i<8;i++) {
+      const side = i<4 ? 1 : -1, k = i%4;
+      const rest = { a: side*(0.55 + k*0.5), r: 2.4 + (k===1||k===2 ? 0.5 : 0) };
+      this.feet.push({ rest, x:0, y:0, tx:0, ty:0, t:1, init:false, phase: (k+ (side>0?0:1)) % 2 });
+    }
+    this.dead = false;
+  }
+  restPos(f) {
+    const a = this.angle + f.rest.a + (f.rest.a>0 ? 0 : 0);
+    return [this.x + Math.cos(a)*this.size*f.rest.r, this.y + Math.sin(a)*this.size*f.rest.r];
+  }
+  update(dt) {
+    this.wob += this.wobSpeed*dt;
+    this.angle += Math.sin(this.wob) * 0.9 * dt;
+    this.x += Math.cos(this.angle)*this.speed*dt;
+    this.y += Math.sin(this.angle)*this.speed*dt;
+    const m = this.size*6;
+    if (this.x<-m||this.x>W+m||this.y<-m||this.y>H+m) this.dead = true;
+    for (const f of this.feet) {
+      const [rx, ry] = this.restPos(f);
+      if (!f.init) { f.x=f.tx=rx; f.y=f.ty=ry; f.init=true; continue; }
+      if (f.t >= 1) {
+        const d = Math.hypot(f.x-rx, f.y-ry);
+        if (d > this.size*1.3) {     // overstretched: step ahead of the rest position
+          f.sx=f.x; f.sy=f.y;
+          f.tx = rx + Math.cos(this.angle)*this.size*0.9;
+          f.ty = ry + Math.sin(this.angle)*this.size*0.9;
+          f.t = 0;
+        }
+      } else {
+        f.t = Math.min(1, f.t + dt*this.speed/(this.size*1.6));
+        const e = f.t*f.t*(3-2*f.t);
+        f.x = f.sx + (f.tx-f.sx)*e; f.y = f.sy + (f.ty-f.sy)*e;
+      }
+    }
+  }
+  draw(c) {
+    const s = this.size;
+    c.lineCap = 'round'; c.lineJoin = 'round';
+    c.strokeStyle = '#050505';
+    for (const f of this.feet) {
+      const side = f.rest.a>0 ? 1 : -1;
+      const hx = this.x + Math.cos(this.angle + f.rest.a*0.35)*s*0.4;
+      const hy = this.y + Math.sin(this.angle + f.rest.a*0.35)*s*0.4;
+      // two-bone IK, knee bows up/outward
+      const L = s*1.55, dx=f.x-hx, dy=f.y-hy;
+      const d = Math.min(Math.hypot(dx,dy), L*1.98) || 1;
+      const h = Math.sqrt(Math.max(0, L*L - d*d/4));
+      const mx = hx+dx/2, my = hy+dy/2;
+      const kx = mx + (-dy/d)*h*side*-1, ky = my + (dx/d)*h*side*-1;
+      c.lineWidth = s*0.16;
+      c.beginPath(); c.moveTo(hx,hy); c.quadraticCurveTo(kx,ky,f.x,f.y); c.stroke();
+    }
+    // abdomen + head
+    c.fillStyle = '#050505';
+    const ca=Math.cos(this.angle), sa=Math.sin(this.angle);
+    c.beginPath(); c.ellipse(this.x-ca*s*0.9, this.y-sa*s*0.9, s*0.95, s*0.75, this.angle, 0, 6.283); c.fill();
+    c.beginPath(); c.ellipse(this.x+ca*s*0.35, this.y+sa*s*0.35, s*0.55, s*0.45, this.angle, 0, 6.283); c.fill();
+    // glowing eyes
+    c.fillStyle = '#ff3b1f';
+    for (const o of [-0.18, 0.18]) {
+      const ex=this.x+ca*s*0.65-sa*s*o*1.4, ey=this.y+sa*s*0.65+ca*s*o*1.4;
+      c.beginPath(); c.arc(ex,ey,s*0.07,0,6.283); c.fill();
+    }
+    // faint highlight so they read on dark photos
+    c.strokeStyle='rgba(255,255,255,.25)'; c.lineWidth=s*0.05;
+    c.beginPath(); c.ellipse(this.x-ca*s*0.9, this.y-sa*s*0.9, s*0.95, s*0.75, this.angle, 0, 6.283); c.stroke();
+  }
+}
+
+// ---------- camera: person / blob detection by motion ----------
+const vid = $('cam'), DW = 80, DH = 45;
+const dcan = document.createElement('canvas'); dcan.width = DW; dcan.height = DH;
+const dctx = dcan.getContext('2d', { willReadFrequently: true });
+let bg = null, lastMotion = -1e9, blob = null, activity = 0;
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 }, audio: false });
+    vid.srcObject = stream; await vid.play();
+    setInterval(detect, 100);
+  } catch (e) {
+    console.warn('Camera unavailable:', e);
+    $('hud').textContent = 'Camera unavailable: ' + e.message;
+  }
+}
+
+function detect() {
+  if (vid.readyState < 2) return;
+  dctx.drawImage(vid, 0, 0, DW, DH);
+  const d = dctx.getImageData(0, 0, DW, DH).data;
+  const n = DW*DH;
+  if (!bg) { bg = new Float32Array(n); for (let i=0;i<n;i++) bg[i] = (d[i*4]+d[i*4+1]+d[i*4+2])/3; return; }
+  let count=0, sx=0, sy=0;
+  for (let i=0;i<n;i++) {
+    const v = (d[i*4]+d[i*4+1]+d[i*4+2])/3;
+    if (Math.abs(v-bg[i]) > CFG.motionThreshold) { count++; sx += i%DW; sy += (i/DW)|0; }
+    bg[i] += (v-bg[i]) * 0.04;     // slowly learn the background so still scenes settle
+  }
+  const frac = count/n;
+  activity = frac;
+  if (frac > CFG.presenceFraction) {
+    lastMotion = performance.now();
+    // camera preview is mirrored, so mirror x to match what people see
+    blob = { x: (1 - (sx/count)/DW) * W, y: ((sy/count)/DH) * H, size: frac };
+  }
+}
+
+// ---------- sound ----------
+const sfx = new Audio('spider.mp3');
+sfx.preload = 'auto';
+let wasPresent = false;
+function playSfx() { if (sfx.paused) { sfx.currentTime = 0; sfx.play().catch(() => {}); } }
+// browsers only allow sound after a click/keypress, so unlock it on the first one
+const unlock = () => { sfx.muted = true; sfx.play().then(() => { sfx.pause(); sfx.currentTime = 0; sfx.muted = false; }).catch(() => { sfx.muted = false; }); };
+addEventListener('click', unlock, { once: true });
+addEventListener('keydown', unlock, { once: true });
+
+// ---------- main loop ----------
+let last = performance.now(), spawnAcc = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now-last)/1000); last = now;
+  const present = now - lastMotion < CFG.holdSeconds*1000;
+  if (present && !wasPresent) playSfx();   // spiders start appearing
+  wasPresent = present;
+  if (present && spiders.length < CFG.maxSpiders) {
+    spawnAcc += dt * (2 + Math.min(10, activity*60));   // more movement -> more spiders
+    while (spawnAcc >= 1) { spawnAcc--; spiders.push(new Spider(blob)); }
+  } else spawnAcc = 0;
+  if (!present && spiders.length < CFG.idleSpiders && Math.random() < dt) spiders.push(new Spider());
+
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  for (const s of spiders) { s.update(dt); s.draw(ctx); }
+  for (let i=spiders.length-1;i>=0;i--) if (spiders[i].dead) spiders.splice(i,1);
+
+  if (document.body.classList.contains('debug'))
+    $('hud').textContent = `motion ${(activity*100).toFixed(1)}%  present ${present}  spiders ${spiders.length}\nkeys: F fullscreen · D debug · S spawn spider`;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- controls ----------
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k==='f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if (k==='d') document.body.classList.toggle('debug');
+  if (k==='s') { spiders.push(new Spider(blob)); playSfx(); }
+  if (k==='arrowright') showNext();
+});
+// browsers require a click/keypress for fullscreen; first click goes fullscreen
+addEventListener('click', () => { if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{}); }, { once:true });
+
+startCamera();
+</script>
+</body>
+</html>
